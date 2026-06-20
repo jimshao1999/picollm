@@ -2,7 +2,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import tiktoken
 import math
+import time
 
 class CausalSelfAttention(nn.Module):
 
@@ -13,6 +15,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # Output proj
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.PICOLLM_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         # Causal mask
@@ -42,6 +45,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.PICOLLM_SCALE_INIT = 1
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -87,8 +91,25 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
     
-    def forward(self, idx):
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'PICOLLM_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
+    def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"cannot have sequence length {T} > block size {self.config.block_size}"
@@ -100,7 +121,10 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -143,38 +167,83 @@ class GPT(nn.Module):
         
         return model
 
+
+# ============ Data Loader =================
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+
+        self.current_position = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position: self.current_position+B*T+1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        
+        self.current_position += B*T
+        if self.current_position + B*T+ 1 >= len(self.tokens):
+            self.current_position = 0
+        return x, y
+# ==========================================
+
+
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+# mps device has weird fluctuations lead to training not converge
 print("using device: ", device)
 
-num_return_sequences = 5
-max_length = 30
-# model = GPT.from_pretrained('gpt2')
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+train_loader = DataLoaderLite(16, 1024)
 model = GPT(GPTConfig())
-model.eval()
 model.to(device)
 
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to(device)
+# optimize!
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # miliseconds
+    print(f"step {i}; loss: {loss.item()}; dt: {dt:2f}ms") # convert tensor to float live on cpu
+
+import sys; sys.exit(0)
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+# x = tokens.to(device)
 
 # generate
-torch.manual_seed(42)
-# torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-        logits = logits[:, -1, :] # (B, vocab_size)
-        probs = F.softmax(logits, dim=-1)
-        # top-k sampling of 50
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # becomes (B, 50)
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        x = torch.cat((x, xcol), dim=-1)
+# torch.manual_seed(42)
+# # torch.cuda.manual_seed(42)
+# while x.size(1) < max_length:
+#     with torch.no_grad():
+#         logits = model(x) # (B, T, vocab_size)
+#         logits = logits[:, -1, :] # (B, vocab_size)
+#         probs = F.softmax(logits, dim=-1)
+#         # top-k sampling of 50
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # becomes (B, 50)
+#         ix = torch.multinomial(topk_probs, 1) # (B, 1)
+#         xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+#         x = torch.cat((x, xcol), dim=-1)
 
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print(">", decoded)
