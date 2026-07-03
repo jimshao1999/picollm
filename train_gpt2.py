@@ -9,6 +9,7 @@ import tiktoken
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from hellaswag import iterate_examples, render_example
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -344,6 +345,12 @@ min_lr = max_lr * 0.1
 warmup_steps = 715
 max_steps = 19073
 
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f:
+    pass
+
 
 def get_lr(it):
     if it < warmup_steps:
@@ -378,6 +385,9 @@ def run_val():
         dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
     if master_process:
         print(f"validation loss: {val_loss_accum.item():.4f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+    return val_loss_accum
 
 
 def sanity_generate():
@@ -392,7 +402,8 @@ def sanity_generate():
     sample_rng.manual_seed(42 + ddp_rank)
     while xgen.size(1) < max_length:
         with torch.no_grad():
-            logits, _ = model(xgen)  # (B, T, vocab_size)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, _ = model(xgen)  # (B, T, vocab_size)
             logits = logits[:, -1, :]  # (B, vocab_size)
             probs = F.softmax(logits, dim=-1)
             # top-k sampling of 50
@@ -407,13 +418,52 @@ def sanity_generate():
         print(f"rank {ddp_rank} sample {i}: {decoded}")
 
 
-for step in range(max_steps):
+resume_path = None  # e.g. "model_step_19073.pt"
+start_step = 0
+if resume_path is not None:
+    ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+    model = GPT(ckpt["config"])
+    model.to(device)
+    model.load_state_dict(ckpt["model"])
+    model = torch.compile(model)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model
+    optimizer = raw_model.configure_optimizers(
+        weight_decay=0.1, learning_rate=6e-4, device=device
+    )
+    optimizer.load_state_dict(ckpt["optimizer"])
+    start_step = ckpt["step"] + 1
+    torch.set_rng_state(ckpt["rng"])
+    if ckpt["cuda_rng"] is not None:
+        torch.cuda.set_rng_state(ckpt["cuda_rng"])
+
+
+for step in range(start_step, max_steps):
     t0 = time.time()
+    last_step = step == max_steps - 1
 
-    if step % 100 == 0:
-        run_val()
+    if step % 250 == 0 or last_step:
+        val_loss_accum = run_val()
 
-    if step > 0 and step % 100 == 0:
+        if master_process and step > 0 and (step % 5000 == 0 or last_step):
+            checkpoint_path = os.path.join(log_dir, f"model_step_{step}.pt")
+            checkpoint = {
+                "model": raw_model.state_dict(),
+                "config": raw_model.config,
+                "step": step,
+                "val_loss": val_loss_accum.item(),
+                # only required for resume training
+                "optimizer": optimizer.state_dict(),
+                "rng": torch.get_rng_state(),
+                "cuda_rng": (
+                    torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+                ),
+            }
+            torch.save(checkpoint, checkpoint_path)
+            print(f"saved checkpoint to {checkpoint_path}")
+
+    if step % 250 == 0 or last_step:
         sanity_generate()
 
     model.train()
@@ -448,6 +498,8 @@ for step in range(max_steps):
         print(
             f"step {step:4d}| loss: {loss_accum.item():.6f}| lr: {lr:.4e} | norm: {norm:.4f}| dt: {dt:.2f}ms| tok/sec: {tokens_per_sec:.2f}"
         )  # convert tensor to float live on cpu
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     destroy_process_group()
