@@ -7,7 +7,6 @@ import tiktoken
 import torch
 import torch.distributed as dist
 from dataloader import DataLoaderLite
-
 from hellaswag import get_most_likely_row, iterate_examples, render_example
 from model import GPT, GPTConfig
 from torch.distributed import destroy_process_group, init_process_group
@@ -202,21 +201,29 @@ class BaseTrainer:
                 self.config.resume_path, map_location=self.device, weights_only=False
             )
             self.model = GPT(ckpt["config"])
-            self.model.load_state_dict(ckpt["model"])
+            # older checkpoints were saved from the compiled/DDP-wrapped model, so
+            # keys may carry a "_orig_mod." (torch.compile) and/or "module." (DDP)
+            # prefix. strip them so they match a fresh, unwrapped GPT.
+            state_dict = {
+                k.replace("_orig_mod.", "").replace("module.", ""): v
+                for k, v in ckpt["model"].items()
+            }
+            self.model.load_state_dict(state_dict)
             self.start_step = ckpt["step"] + 1
             torch.set_rng_state(ckpt["rng"])
             if ckpt["cuda_rng"] is not None:
                 torch.cuda.set_rng_state(ckpt["cuda_rng"])
 
         self.model.to(self.device)
-        # keep an uncompiled handle for evals/sampling: HellaSwag & generation
-        # feed variable-length inputs, which would make the compiled model
-        # recompile on every call. shares params with the compiled model.
-        self.orig_model = self.model
+        # raw_model = the bare, uncompiled/unwrapped GPT; grab it BEFORE compile/DDP.
+        # it shares parameter tensors with self.model, so it always has the live
+        # weights. use it for eval/generation (avoids torch.compile recompiles on
+        # variable-length inputs) and for checkpoint/optimizer (clean state_dict
+        # keys, no _orig_mod./module. prefixes, correct under DDP too).
+        self.raw_model = self.model
         self.model = torch.compile(self.model)
         if self.ddp:
             self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
-        self.raw_model = self.model.module if self.ddp else self.model
 
         self.optimizer = self.raw_model.configure_optimizers(
             weight_decay=self.config.weight_decay,
@@ -279,7 +286,7 @@ class BaseTrainer:
             mask = mask.to(self.device)
             # use the uncompiled model: inputs change shape every example
             with torch.autocast(device_type=self.device_type, dtype=torch.bfloat16):
-                logits, _ = self.orig_model(tokens)
+                logits, _ = self.raw_model(tokens)
             pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
