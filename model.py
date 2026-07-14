@@ -12,21 +12,14 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # Separate q, k, v
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         # Output proj
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.c_proj.PICOLLM_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        # Causal mask
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
-            ),
-        )
 
-    def forward(self, x):
+    def forward(self, x, cos, sin):
         B, T, C = x.size()
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
@@ -45,6 +38,9 @@ class CausalSelfAttention(nn.Module):
         # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         # att = F.softmax(att, dim=-1)
         # y = att @ v  # (B, nh, T, T) @ (B, nh, T, hs) = (B, nh, T, hs)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k)
 
         # Flash attention
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -57,14 +53,13 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu = nn.GELU(approximate="tanh")
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.PICOLLM_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -73,14 +68,12 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+    def forward(self, x, cos, sin):
+        x = x + self.attn(norm(x), cos, sin)
+        x = x + self.mlp(norm(x))
         return x
 
 
@@ -102,49 +95,53 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
-                wpe=nn.Embedding(
-                    config.block_size, config.n_embd
-                ),  # why block size instead of T in BTC?
                 h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-                ln_f=nn.LayerNorm(config.n_embd),
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # weight sharing scheme
-        self.transformer.wte.weight = self.lm_head.weight
+        head_dim = config.n_embd // config.n_head
+        cos, sin = precompute_rope(config.block_size, head_dim)
+        self.register_buffer(
+            "cos", cos[None, None, :, :], persistent=False
+        )  # (1, 1, T, T)
+        self.register_buffer(
+            "sin", sin[None, None, :, :], persistent=False
+        )  # (1, 1, T, T)
 
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            std = 0.02
+            std = 0.001
             if hasattr(module, "PICOLLM_SCALE_INIT"):
                 std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.001)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, loss_reduction="mean"):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert (
             T <= self.config.block_size
         ), f"cannot have sequence length {T} > block size {self.config.block_size}"
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # shape T
-        pos_emb = self.transformer.wpe(pos)  # shape (T, n_embd)
         tok_emb = self.transformer.wte(idx)  # shape (B, T, n_embd)
-        x = pos_emb + tok_emb
+        x = tok_emb
+        cos, sin = self.cos[:, :, :T], self.sin[:, :, :T]
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)  # (B, T, vocab_size)
+            x = block(x, cos, sin)
+        x = norm(x)
+        logits = self.lm_head(x).float()  # (B, T, vocab_size)
+        logits = 15.0 * torch.tanh(logits / 15.0)
         loss = None
         if targets is not None:
+            # loss_reduction="mean" for pretrain/SFT; "none" for RL (per-token NLL)
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction=loss_reduction,
             )
         return logits, loss
 
@@ -166,7 +163,6 @@ class GPT(nn.Module):
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith(".attn.bias")]
 
         # model init
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -174,7 +170,6 @@ class GPT(nn.Module):
 
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(".attn.masked_bias")]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(".attn.bias")]
         transposed = [
             "attn.c_attn.weight",
             "attn.c_proj.weight",
@@ -225,3 +220,24 @@ class GPT(nn.Module):
             optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
         )
         return optimizer
+
+
+def precompute_rope(seq_len, head_dim, base=10000.0):
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    t = torch.arange(seq_len).float()
+    freqs = torch.outer(t, inv_freq)
+    return freqs.cos(), freqs.sin()
+
+
+def apply_rotary_emb(x, cos, sin):
+    # x: [B, n_head, T, head_dim]
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    cos, sin = cos.to(x.dtype), sin.to(x.dtype)
+    y1 = x1 * cos + x2 * sin
+    y2 = x2 * cos - x1 * sin
+    return torch.cat([y1, y2], dim=-1)
+
+
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))

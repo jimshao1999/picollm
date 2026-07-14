@@ -16,6 +16,7 @@ class SFTConfig(TrainConfig):
     learning_rate: float = 3e-5
     warmup_steps: int = 50
     max_steps: int = 2000
+    ckpt_every: int = 1000  # SFT is short/fast; save every 1000 (must be multiple of 250)
     log_dir: str = "log_sft"
     base_checkpoint: str = "log/model_step_19072.pt"
 
@@ -42,11 +43,10 @@ class SFTTrainer(BaseTrainer):
         )
 
     def setup_model(self):
-        self.start_step = 0
-        # load the base model from the base model checkpoint
-        ckpt = torch.load(
-            self.config.base_checkpoint, map_location=self.device, weights_only=False
-        )
+        # resume from a mid-SFT checkpoint, else start fresh from the base model
+        resume = self.config.resume_path is not None
+        ckpt_path = self.config.resume_path if resume else self.config.base_checkpoint
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         self.model = GPT(ckpt["config"])
         sd = {
             k.replace("_orig_mod.", "").replace("module.", ""): v
@@ -63,6 +63,17 @@ class SFTTrainer(BaseTrainer):
             learning_rate=self.config.learning_rate,
             device=self.device,
         )
+        if resume:
+            # continue the SFT run: restore step, optimizer, and rng
+            self.start_step = ckpt["step"] + 1
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+            torch.set_rng_state(ckpt["rng"].cpu())
+            if ckpt.get("cuda_rng") is not None:
+                torch.cuda.set_rng_state(ckpt["cuda_rng"].cpu())
+            if self.master_process:
+                print(f"resumed SFT from {ckpt_path} at step {self.start_step}")
+        else:
+            self.start_step = 0
 
     def _run_hellaswag(self, step):
         pass
@@ -123,9 +134,35 @@ if __name__ == "__main__":
         action="store_true",
         help="overfit a single batch to sanity-check the SFT pipeline",
     )
+    parser.add_argument(
+        "--base-checkpoint",
+        type=str,
+        default=None,
+        help="base model checkpoint to SFT from (overrides SFTConfig default)",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="dir for SFT logs + checkpoints (use a distinct name per base model)",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="mid-SFT checkpoint to resume from (restores step+optimizer+rng)",
+    )
     args = parser.parse_args()
+
+    overrides = {}
+    if args.base_checkpoint is not None:
+        overrides["base_checkpoint"] = args.base_checkpoint
+    if args.log_dir is not None:
+        overrides["log_dir"] = args.log_dir
+    if args.resume is not None:
+        overrides["resume_path"] = args.resume
 
     if args.overfit:
         overfit_one_batch()
     else:
-        SFTTrainer(SFTConfig()).train()
+        SFTTrainer(SFTConfig(**overrides)).train()

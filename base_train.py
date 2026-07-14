@@ -71,7 +71,7 @@ class BaseTrainer:
             if step % 250 == 0 or last_step:
                 val_loss_accum = self._run_val(step)
 
-                if self.master_process and step > 0 and (step % 5000 == 0 or last_step):
+                if self.master_process and step > 0 and (step % self.config.ckpt_every == 0 or last_step):
                     checkpoint_path = os.path.join(
                         self.config.log_dir, f"model_step_{step}.pt"
                     )
@@ -210,9 +210,10 @@ class BaseTrainer:
             }
             self.model.load_state_dict(state_dict)
             self.start_step = ckpt["step"] + 1
-            torch.set_rng_state(ckpt["rng"])
+            # rng states must be CPU ByteTensors; map_location moved them to cuda
+            torch.set_rng_state(ckpt["rng"].cpu())
             if ckpt["cuda_rng"] is not None:
-                torch.cuda.set_rng_state(ckpt["cuda_rng"])
+                torch.cuda.set_rng_state(ckpt["cuda_rng"].cpu())
 
         self.model.to(self.device)
         # raw_model = the bare, uncompiled/unwrapped GPT; grab it BEFORE compile/DDP.
@@ -236,7 +237,9 @@ class BaseTrainer:
     def setup_logging(self):
         os.makedirs(self.config.log_dir, exist_ok=True)
         self.log_file = os.path.join(self.config.log_dir, f"log.txt")
-        with open(self.log_file, "w") as f:
+        # truncate on a fresh run, but append when resuming so we keep the history
+        mode = "a" if self.config.resume_path is not None else "w"
+        with open(self.log_file, mode) as f:
             pass
 
     def _get_lr(self, it):
@@ -339,4 +342,32 @@ class BaseTrainer:
 
 
 if __name__ == "__main__":
-    BaseTrainer(TrainConfig()).train()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default="log",
+        help="dir for logs + checkpoints; use a distinct name per run to avoid clobbering",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="override number of training steps (handy for short baseline runs)",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="checkpoint path to resume from (loads model+optimizer+rng+step)",
+    )
+    args = parser.parse_args()
+
+    overrides = {"log_dir": args.log_dir}
+    if args.max_steps is not None:
+        overrides["max_steps"] = args.max_steps
+    if args.resume is not None:
+        overrides["resume_path"] = args.resume
+    BaseTrainer(TrainConfig(**overrides)).train()

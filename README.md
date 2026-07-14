@@ -32,16 +32,24 @@ Training config lives in `TrainConfig` (`base_train.py`): full run is
 `max_steps=19073`, `total_batch_size=524288` (~0.5M tokens/step), i.e. ~10B
 tokens = 1 epoch over the dataset.
 
-## Results (2026-07-04)
+## Results
 
-Full run: 19073 steps, 10B tokens, ~0.5M tokens/step.
+Two architectures trained from scratch under identical config, data, and budget
+(19073 steps, 10B tokens of FineWeb-Edu, ~0.5M tokens/step): the original **GPT-2
+(2019)** recipe, and a **modern dense** stack (RoPE, RMSNorm, QK-norm, ReLU² MLP,
+no biases, untied embeddings, logit softcap).
 
-| Metric | picollm (this run) | GPT-2 (124M) | build-nanogpt repro |
-|--------|--------------------|--------------|---------------------|
-| Final val loss (FineWeb-Edu) | **3.257** | – | ~3.28 |
-| HellaSwag acc_norm | **0.281** | 0.2955 | ~0.305 |
+| Metric | GPT-2 baseline | modern-dense | reference (GPT-2 / build-nanogpt) |
+|--------|----------------|--------------|------------------------------------|
+| Final val loss (FineWeb-Edu) | 3.257 | **3.180** | ~3.28 |
+| HellaSwag acc_norm | 0.281 | **0.287** | 0.2955 / ~0.305 |
 
-Training is healthy: init loss 10.955 (≈ ln(50304)), and the final validation loss is on par with (slightly better than) the reference. HellaSwag lands ~1–2 points below GPT-2 / the reference reproduction. The LM loss matches the reference while HellaSwag is slightly lower, the remaining gap is to be investigated.
+The baseline is healthy: init loss 10.955 (≈ ln(50304)), final val on par with the
+reference. The **modern architecture is ~0.08 nats lower across the whole curve**
+(~7% lower perplexity) — a clean, consistent win. HellaSwag barely moves (+0.006):
+it's an emergent benchmark that stays near chance at 124M scale regardless of loss.
+Caveat: untying the embeddings adds ~39M params (~163M vs 124M total), so part of
+the gain is extra capacity, not pure architectural efficiency.
 
 ## SFT — chat model
 
