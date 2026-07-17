@@ -1,28 +1,33 @@
+import contextlib
 import os
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from chat_cli import device, load_model
 from tasks.gsm8k import GSM8K
 from tokenizer import ChatTokenizer
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 @torch.no_grad()
-def sample_completion(
+def sample_completion_batched(
     model,
     tok,
     prompt_ids,
     device,
     device_type,
+    k=16,
     max_new_tokens=256,
     temperature=1.0,
     top_k=50,
 ):
-    """Sample a completion from a prompt."""
+    """Sample k completions for a prompt."""
     assistant_end = tok.encode_special("<|assistant_end|>")
     ids = list(prompt_ids)
     prefix_len = len(ids)
-    x = torch.tensor([ids], dtype=torch.long, device=device)
+    x = torch.tensor([ids] * k, dtype=torch.long, device=device)
+    finished = torch.zeros(k, dtype=torch.bool, device=device)
     for _ in range(max_new_tokens):
         idx = x[:, -model.config.block_size :]
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
@@ -31,13 +36,18 @@ def sample_completion(
         if top_k > 0:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
             logits[logits < v[:, [-1]]] = -float("Inf")
-        nxt = torch.multinomial(F.softmax(logits, dim=-1), 1)
-        tid = nxt.item()
-        ids.append(tid)
-        x = torch.cat((x, nxt), dim=-1)
-        if tid == assistant_end:
+        nxt = torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(1)
+        nxt = torch.where(finished, torch.full_like(nxt, assistant_end), nxt)
+        x = torch.cat((x, nxt.unsqueeze(1)), dim=1)
+        finished = finished | (nxt == assistant_end)
+        if finished.all():
             break
-    return ids, prefix_len
+    seqs = []
+    for row in x[:, prefix_len:].tolist():
+        if assistant_end in row:
+            row = row[: row.index(assistant_end) + 1]
+        seqs.append(ids + row)
+    return seqs, prefix_len
 
 
 @torch.no_grad()
@@ -66,17 +76,18 @@ def get_rollout(
 
     ## 1. sample k completions, score each
     seqs, rewards = [], []
-    for _ in range(k):
-        ids, prefix_len = sample_completion(
-            model,
-            tok,
-            prompt_ids,
-            device,
-            device_type,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        )
+    seq_ids, prefix_len = sample_completion_batched(
+        model,
+        tok,
+        prompt_ids,
+        device,
+        device_type,
+        k=k,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+    )
+    for ids in seq_ids:
         gen_text = tok.tokenizer.decode([t for t in ids[prefix_len:] if t < 50257])
         r = task.evaluate(example, gen_text, lenient=not strict_reward)
         rewards.append(float(r))
@@ -84,9 +95,9 @@ def get_rollout(
 
     rewards = torch.tensor(rewards, dtype=torch.float, device=device)
 
-    ## 2. advantage = reward - group mean; if all rewards equal, advantage = 0 -> skip
-    if rewards.std() == 0:
-        return None
+    ## 2. advantage = reward - group mean.
+    ## degenerate groups (all rewards equal) naturally get advantages=0 -> zero gradient
+    ## (harmless). we KEEP them so per-step work is fixed (no DDP straggler from resampling).
     advantages = rewards - rewards.mean()
 
     ## 3. pad to common length, builds (inputs, targets) with prompt+pad masked to -1
@@ -125,6 +136,9 @@ def evaluate_passk(
     temperature=1.0,
     top_k=50,
     lenient=True,
+    ddp=False,
+    world=1,
+    rank=0,
 ):
     """Honest progress metric: pass@1 / pass@k on the test split (uses the LIVE model)."""
     assistant_start = tok.encode_special("<|assistant_start|>")
@@ -132,7 +146,7 @@ def evaluate_passk(
     model.eval()
     n = min(n, len(task))
     correct, total, solved = 0, 0, 0
-    for i in range(n):
+    for i in range(rank, n, world):
         ex = task[i]
         question = ex["messages"][0]["content"]
         prompt_ids, _ = tok.render_conversation(
@@ -140,22 +154,28 @@ def evaluate_passk(
         )
         prompt_ids = prompt_ids + [assistant_start]
         flags = []
-        for _ in range(k):
-            ids, prefix_len = sample_completion(
-                model,
-                tok,
-                prompt_ids,
-                device,
-                device_type,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-            )
+
+        seq_ids, prefix_len = sample_completion_batched(
+            model,
+            tok,
+            prompt_ids,
+            device,
+            device_type,
+            k=k,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        for ids in seq_ids:
             gen = tok.tokenizer.decode([t for t in ids[prefix_len:] if t < 50257])
             flags.append(task.evaluate(ex, gen, lenient=lenient))
         correct += sum(flags)
         total += k
         solved += 1 if any(flags) else 0
+    if ddp:
+        t = torch.tensor([correct, total, solved], dtype=torch.float, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        correct, total, solved = t.tolist()
     if was_training:
         model.train()
     return correct / max(total, 1), solved / max(n, 1)
@@ -178,22 +198,41 @@ def rl_train(
     ckpt_every=1000,
     log_dir="log_rl",
 ):
-    model = load_model(ckpt_path)
+    ddp = int(os.environ.get("RANK", -1)) != -1
+    if ddp:
+        dist.init_process_group("nccl")
+        rank = int(os.environ.get("RANK"))
+        local_rank = int(os.environ.get("LOCAL_RANK"))
+        world = int(os.environ.get("WORLD_SIZE"))
+        torch.cuda.set_device(local_rank)
+    else:
+        rank = 0
+        local_rank = 0
+        world = 1
+
+    master = rank == 0
+    raw_model = load_model(ckpt_path)
+    model = DDP(raw_model, device_ids=[local_rank]) if ddp else raw_model
     tok = ChatTokenizer()
     task = GSM8K(subset="main", split="train")
     val_task = GSM8K(subset="main", split="test")
     device_type = "cuda" if device.startswith("cuda") else device
-    optimizer = model.configure_optimizers(
+    optimizer = raw_model.configure_optimizers(
         weight_decay=0.0, learning_rate=lr, device=device
     )
-    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "log.txt")
+    if master:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(log_file, "w") as f:  # fresh log for this run
+            pass
 
-    cursor = 0
+    examples_per_rank = max(examples_per_step // world, 1)
+    cursor = rank
     for step in range(steps):
         ## periodic eval on the test split (honest progress metric)
         if step % eval_every == 0:
             p1, pk = evaluate_passk(
-                model,
+                raw_model,
                 tok,
                 val_task,
                 device,
@@ -204,16 +243,23 @@ def rl_train(
                 temperature=temperature,
                 top_k=top_k,
                 lenient=not strict_reward,
+                ddp=ddp,
+                world=world,
+                rank=rank,
             )
-            print(f"  [eval step={step}] pass@1={p1:.4f} pass@{eval_k}={pk:.4f}")
+            if master:
+                print(f"[eval step={step}] pass@1={p1:.4f} pass@{eval_k}={pk:.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} eval_pass@1 {p1:.4f}\n")
+                    f.write(f"{step} eval_pass@{eval_k} {pk:.4f}\n")
 
-        ## 1. gather a few NON-degenerate groups
+        ## 1. gather a FIXED number of groups per rank (no skipping -> deterministic
+        ## per-step cost, no DDP straggler). degenerate groups just contribute 0 gradient.
         model.eval()
         rollouts = []
-        degenerate = 0
-        while len(rollouts) < examples_per_step:
+        for _ in range(examples_per_rank):
             out = get_rollout(
-                model,
+                raw_model,
                 tok,
                 task,
                 task[cursor % len(task)],
@@ -225,11 +271,9 @@ def rl_train(
                 top_k=top_k,
                 strict_reward=strict_reward,
             )
-            cursor += 1
-            if out is not None:
-                rollouts.append(out)
-            else:
-                degenerate += 1
+            cursor += world
+            rollouts.append(out)
+        degenerate = sum(1 for r in rollouts if float(r["rewards"].std()) == 0)
 
         ## 2. policy gradient update
         model.train()
@@ -237,14 +281,19 @@ def rl_train(
         # token-level normalization across all rollouts in this step
         num_valid = max(sum(int((r["targets"] != -1).sum()) for r in rollouts), 1)
         reward_sum, sample_count = 0.0, 0
-        for r in rollouts:
-            inputs, targets, advantages = r["inputs"], r["targets"], r["advantages"]
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                # model returns (logits, loss); with reduction="none", loss is per-token
-                _, loss = model(inputs, targets, loss_reduction="none")
-                logp = -loss.view_as(inputs)  # (k, T) per-token log-probs
-            pg_obj = (logp * advantages.unsqueeze(-1)).sum() / num_valid  # scalar
-            (-pg_obj).backward()  # accumulate grads across rollouts
+        for j, r in enumerate(rollouts):
+            is_last = j == len(rollouts) - 1
+            sync_ctx = (
+                contextlib.nullcontext() if (is_last or not ddp) else model.no_sync()
+            )
+            with sync_ctx:
+                inputs, targets, advantages = r["inputs"], r["targets"], r["advantages"]
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    # model returns (logits, loss); with reduction="none", loss is per-token
+                    _, loss = model(inputs, targets, loss_reduction="none")
+                    logp = -loss.view_as(inputs)  # (k, T) per-token log-probs
+                pg_obj = (logp * advantages.unsqueeze(-1)).sum() / num_valid  # scalar
+                (-pg_obj).backward()  # accumulate grads across rollouts
             reward_sum += r["rewards"].sum().item()
             sample_count += r["rewards"].numel()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -252,20 +301,26 @@ def rl_train(
 
         # NOTE: reward is averaged over TRAINED (non-degenerate) groups only, so it
         # reads high vs true accuracy; watch the trend, and 'degenerate' for sparsity.
-        mean_reward = reward_sum / sample_count
-        print(
-            f"step={step:4d} | reward={mean_reward:.4f} | groups={len(rollouts)} | "
-            f"degenerate_skipped={degenerate} | valid_tokens={num_valid}"
-        )
+        if master:
+            mean_reward = reward_sum / sample_count
+            print(
+                f"step={step:4d} | reward={mean_reward:.4f} | groups={len(rollouts)} | "
+                f"degenerate_skipped={degenerate} | valid_tokens={num_valid}"
+            )
+            with open(log_file, "a") as f:
+                f.write(f"{step} reward {mean_reward:.4f} degenerate {degenerate}\n")
 
         ## periodic checkpoint (and always at the last step)
-        if step > 0 and (step % ckpt_every == 0 or step == steps - 1):
+        if master and step > 0 and (step % ckpt_every == 0 or step == steps - 1):
             path = os.path.join(log_dir, f"model_step_{step}.pt")
             torch.save(
-                {"model": model.state_dict(), "config": model.config, "step": step},
+                {"model": raw_model.state_dict(), "config": raw_model.config, "step": step},
                 path,
             )
             print(f"saved checkpoint to {path}")
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 def run_verify(
@@ -297,7 +352,7 @@ def run_verify(
             top_k=top_k,
             strict_reward=strict_reward,
         )
-        if out is None:
+        if float(out["rewards"].std()) == 0:
             print(f"[{i}] degenerate group (all rewards equal) — skipping")
             continue
         rewards, adv = out["rewards"], out["advantages"]
@@ -334,7 +389,7 @@ if __name__ == "__main__":
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--k", type=int, default=16)
     p.add_argument("--examples-per-step", type=int, default=8)
-    p.add_argument("--lr", type=float, default=1e-6)
+    p.add_argument("--lr", type=float, default=1e-5)  # 1e-6 was too low; RL needs a bigger step
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument(
         "--strict", action="store_true", help="strict reward (require '#### N')"

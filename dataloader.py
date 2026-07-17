@@ -11,14 +11,13 @@ def load_tokens(filename):
 
 
 class DataLoaderLite:
-    def __init__(self, B, T, proc_rank, num_procs, split):
+    def __init__(self, B, T, proc_rank, num_procs, split, data_root="edu_fineweb10B"):
         self.B = B
         self.T = T
         self.proc_rank = proc_rank
         self.num_procs = num_procs
         assert split in {"train", "val"}
 
-        data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)

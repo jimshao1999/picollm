@@ -19,6 +19,8 @@ class SFTConfig(TrainConfig):
     ckpt_every: int = 1000  # SFT is short/fast; save every 1000 (must be multiple of 250)
     log_dir: str = "log_sft"
     base_checkpoint: str = "log/model_step_19072.pt"
+    mix_gsm8k: bool = False  # blend GSM8K into SFT (teaches math + #### format for RL)
+    gsm8k_epochs: int = 4
 
 
 class SFTTrainer(BaseTrainer):
@@ -32,6 +34,8 @@ class SFTTrainer(BaseTrainer):
             self.ddp_world_size,
             split="train",
             tokenizer=self.tok,
+            mix_gsm8k=c.mix_gsm8k,
+            gsm8k_epochs=c.gsm8k_epochs,
         )
         self.val_loader = SFTDataLoader(
             c.B,
@@ -40,6 +44,8 @@ class SFTTrainer(BaseTrainer):
             self.ddp_world_size,
             split="test",
             tokenizer=self.tok,
+            mix_gsm8k=c.mix_gsm8k,
+            gsm8k_epochs=c.gsm8k_epochs,
         )
 
     def setup_model(self):
@@ -152,6 +158,11 @@ if __name__ == "__main__":
         default=None,
         help="mid-SFT checkpoint to resume from (restores step+optimizer+rng)",
     )
+    parser.add_argument(
+        "--mix-gsm8k",
+        action="store_true",
+        help="blend GSM8K into the SFT mixture (teaches math + #### format for RL)",
+    )
     args = parser.parse_args()
 
     overrides = {}
@@ -161,6 +172,8 @@ if __name__ == "__main__":
         overrides["log_dir"] = args.log_dir
     if args.resume is not None:
         overrides["resume_path"] = args.resume
+    if args.mix_gsm8k:
+        overrides["mix_gsm8k"] = True
 
     if args.overfit:
         overfit_one_batch()

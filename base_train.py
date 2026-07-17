@@ -32,7 +32,12 @@ class TrainConfig:
     hella_every: int = 250
     ckpt_every: int = 5000
     log_dir: str = "log"
+    data_root: str = "edu_fineweb10B"
     vocab_size: int = 50304
+    # model size (defaults = 124M "GPT-2"); scale these for d26 (~1B)
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
     seed: int = 1337
     resume_path: str | None = None
 
@@ -182,6 +187,7 @@ class BaseTrainer:
             proc_rank=self.ddp_rank,
             num_procs=self.ddp_world_size,
             split="train",
+            data_root=self.config.data_root,
         )
         self.val_loader = DataLoaderLite(
             B=self.config.B,
@@ -189,12 +195,21 @@ class BaseTrainer:
             proc_rank=self.ddp_rank,
             num_procs=self.ddp_world_size,
             split="val",
+            data_root=self.config.data_root,
         )
 
     def setup_model(self):
         self.enc = tiktoken.get_encoding("gpt2")
         self.start_step = 0
-        self.model = GPT(GPTConfig(vocab_size=50304))
+        self.model = GPT(
+            GPTConfig(
+                block_size=self.config.T,
+                vocab_size=self.config.vocab_size,
+                n_layer=self.config.n_layer,
+                n_head=self.config.n_head,
+                n_embd=self.config.n_embd,
+            )
+        )
 
         if self.config.resume_path is not None:
             ckpt = torch.load(
@@ -222,6 +237,18 @@ class BaseTrainer:
         # variable-length inputs) and for checkpoint/optimizer (clean state_dict
         # keys, no _orig_mod./module. prefixes, correct under DDP too).
         self.raw_model = self.model
+        # scale LR by width: base LRs are tuned for n_embd=768, so a wider model
+        # (e.g. d26 -> 1664) needs a proportionally smaller LR (~1/sqrt(width)).
+        lr_scale = (768 / self.raw_model.config.n_embd) ** 0.5
+        if lr_scale != 1.0:
+            self.config.max_lr *= lr_scale
+            self.config.min_lr *= lr_scale
+            self.config.learning_rate *= lr_scale
+            if self.master_process:
+                print(
+                    f"LR scaled x{lr_scale:.4f} for n_embd={self.raw_model.config.n_embd}: "
+                    f"max_lr={self.config.max_lr:.2e} min_lr={self.config.min_lr:.2e}"
+                )
         self.model = torch.compile(self.model)
         if self.ddp:
             self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
@@ -363,11 +390,36 @@ if __name__ == "__main__":
         default=None,
         help="checkpoint path to resume from (loads model+optimizer+rng+step)",
     )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        help="model-size dial: n_layer=depth, n_embd=depth*64 (rounded to /128), "
+        "n_head=n_embd/128. e.g. --depth 26 for the ~1B model (default 124M)",
+    )
+    parser.add_argument("--device-batch-size", type=int, default=None,
+                        help="per-GPU micro-batch B (lower for big models to fit memory)")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="dir of tokenized shards (e.g. edu_fineweb20B)")
+    parser.add_argument("--ckpt-every", type=int, default=None,
+                        help="save a checkpoint every N steps (must be a multiple of 250)")
     args = parser.parse_args()
 
     overrides = {"log_dir": args.log_dir}
+    if args.data_dir is not None:
+        overrides["data_root"] = args.data_dir
+    if args.ckpt_every is not None:
+        overrides["ckpt_every"] = args.ckpt_every
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
     if args.resume is not None:
         overrides["resume_path"] = args.resume
+    if args.device_batch_size is not None:
+        overrides["B"] = args.device_batch_size
+    if args.depth is not None:
+        n_embd = ((args.depth * 64 + 127) // 128) * 128  # round up to multiple of 128
+        overrides["n_layer"] = args.depth
+        overrides["n_embd"] = n_embd
+        overrides["n_head"] = n_embd // 128  # head_dim = 128
+        print(f"[depth={args.depth}] n_layer={args.depth} n_embd={n_embd} n_head={n_embd // 128}")
     BaseTrainer(TrainConfig(**overrides)).train()

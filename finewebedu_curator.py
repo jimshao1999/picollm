@@ -12,14 +12,18 @@ import tiktoken
 from datasets import load_dataset
 from tqdm import tqdm
 
-local_dir = "edu_fineweb10B"
-remote_name = "sample-10BT"
-shard_size = int(1e8)  # 100M tokens per shard; total 100 shards
+local_dir = "edu_fineweb20B"
+remote_name = "sample-100BT"
+shard_size = int(1e8)  # 100M tokens per shard
+max_shards = 200  # 200 * 100M = ~20B tokens (1 val + 199 train). set None for all.
 
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
-fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
+# streaming=True so we only download what we actually consume (~20B), NOT the full 100B
+fw = load_dataset(
+    "HuggingFaceFW/fineweb-edu", name=remote_name, split="train", streaming=True
+)
 
 enc = tiktoken.get_encoding("gpt2")
 eot = enc._special_tokens["<|endoftext|>"]
@@ -73,6 +77,8 @@ with mp.Pool(nprocs) as pool:
             progress_bar = None
             all_tokens_np[0 : len(tokens) - remainder] = tokens[remainder:]
             token_count = len(tokens) - remainder
+            if max_shards is not None and shard_index >= max_shards:
+                break  # stop after ~20B tokens instead of downloading all 100B
 
     # write remaining to last shard
     if token_count != 0:

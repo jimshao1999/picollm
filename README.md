@@ -62,3 +62,15 @@ python chat_cli.py --ckpt log_sft/model_step_01999.pt  # chat with it
 ```
 
 Result (2000 steps, LR 3e-5): train/val loss plateau at **~1.73**. The plateau is expected — SFT loss floors at the entropy of free-form assistant text; it can't reach 0 like the single-batch overfit. The model replies coherently in chat format and stops on `<|assistant_end|>` (it hallucinates freely — a 124M-scale limit, not an SFT bug).
+
+## RL (GRPO) and why we move to a 1B model
+
+We implemented GRPO-style RL on GSM8K (group-relative advantages, on-policy, no critic/KL) to push math reasoning. It ran correctly end-to-end — but **on the 124M base it didn't move the needle**, and that turned out to be a *scale* problem, not a pipeline problem:
+
+- **SmolTalk-only SFT:** GSM8K pass@8 ≈ **6%**.
+- **SFT with GSM8K blended in (×4 epochs):** pass@8 ≈ **5%** — the model learned the `#### <answer>` format but not how to *solve* the problems.
+- **RL on top:** eval pass@1 stayed flat (~0.01) over 1000s of steps.
+
+RL only *amplifies* ability the base already has, and at 124M there's almost none to amplify (pass@1 ≈ 0.5–1%). SFT and RL teach **format and consistency**, not raw reasoning — that capability is set in **pretraining**, and it's an emergent property of scale. The same reason HellaSwag stayed near chance is why GSM8K stays near zero: a 124M model is simply below the capability threshold for these tasks.
+
+**So the bottleneck is model size, not the recipe** — which motivates scaling the (now-modernized) architecture to **~1B (`--depth 26`)**, trained Chinchilla-optimally on 20B tokens, where reasoning benchmarks begin to emerge.

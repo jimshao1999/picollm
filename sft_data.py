@@ -1,6 +1,29 @@
+import random
+
 import torch
 from datasets import load_dataset
 from tokenizer import ChatTokenizer
+
+
+class MixtureDataset:
+    """Interleave several {"messages": ...} datasets with integer weights (epochs).
+    e.g. weights=[1, 4] => 1 pass of dataset[0] + 4 passes of dataset[1], shuffled."""
+
+    def __init__(self, datasets, weights=None, seed=42):
+        self.datasets = datasets
+        weights = weights or [1] * len(datasets)
+        self.index = []
+        for di, (d, w) in enumerate(zip(datasets, weights)):
+            for _ in range(w):
+                self.index.extend((di, i) for i in range(len(d)))
+        random.Random(seed).shuffle(self.index)
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        di, li = self.index[idx % len(self.index)]
+        return self.datasets[di][li]
 
 
 class SFTDataLoader:
@@ -8,13 +31,33 @@ class SFTDataLoader:
     One conversation per row. Matches the DataloaderLite's interface.
     """
 
-    def __init__(self, B, T, proc_rank, num_procs, split="train", tokenizer=None):
+    def __init__(
+        self,
+        B,
+        T,
+        proc_rank,
+        num_procs,
+        split="train",
+        tokenizer=None,
+        mix_gsm8k=False,
+        gsm8k_epochs=4,
+    ):
         self.B = B
         self.T = T
         self.proc_rank = proc_rank
         self.num_procs = num_procs
         assert split in {"train", "test"}
-        self.dataset = SmolTalk(split=split)
+        if mix_gsm8k:
+            # blend GSM8K (weighted) into SmolTalk so the model learns math + the
+            # "#### <answer>" format -> higher GSM8K pass@k -> denser RL signal.
+            from tasks.gsm8k import GSM8K
+
+            self.dataset = MixtureDataset(
+                [SmolTalk(split=split), GSM8K(subset="main", split=split)],
+                weights=[1, gsm8k_epochs],
+            )
+        else:
+            self.dataset = SmolTalk(split=split)
         self.n = len(self.dataset)
         self.tokenizer = tokenizer or ChatTokenizer()
         self.pad_id = self.tokenizer.encode_special("<|endoftext|>")
