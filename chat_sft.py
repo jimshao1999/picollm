@@ -163,6 +163,12 @@ if __name__ == "__main__":
         action="store_true",
         help="blend GSM8K into the SFT mixture (teaches math + #### format for RL)",
     )
+    parser.add_argument(
+        "--device-batch-size",
+        type=int,
+        default=None,
+        help="per-GPU micro-batch B (lower for big models, e.g. 16 for the 1B d26)",
+    )
     args = parser.parse_args()
 
     overrides = {}
@@ -174,6 +180,8 @@ if __name__ == "__main__":
         overrides["resume_path"] = args.resume
     if args.mix_gsm8k:
         overrides["mix_gsm8k"] = True
+    if args.device_batch_size is not None:
+        overrides["B"] = args.device_batch_size
 
     if args.overfit:
         overfit_one_batch()
