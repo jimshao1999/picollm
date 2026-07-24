@@ -78,16 +78,18 @@ class GSM8K:
         return float(self.evaluate(example, generated_text))
 
 
-def run_gate(ckpt_path, n=100, k=8, temperature=1.0, max_new_tokens=256, lenient=True):
+def run_gate(ckpt_path, n=100, k=8, temperature=1.0, max_new_tokens=256, lenient=True,
+             task_name="gsm8k"):
     """RL signal gate: sample k completions per question and report pass@1 / pass@k.
     pass@k > 0 => the model sometimes succeeds => RL has something to amplify."""
     from chat_cli import device, generate_reply, load_model
+    from tasks import make_task
     from tokenizer import ChatTokenizer
 
     model = load_model(ckpt_path)
     tok = ChatTokenizer()
     device_type = "cuda" if device.startswith("cuda") else device
-    task = GSM8K(subset="main", split="test")
+    task = make_task(task_name, "test")
     n = min(n, len(task))
     print(f"gate: ckpt={ckpt_path} | n={n} questions | k={k} samples | "
           f"temp={temperature} | lenient={lenient}\n")
@@ -133,11 +135,15 @@ if __name__ == "__main__":
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--strict", action="store_true", help="require '#### N' (default: lenient)")
+    p.add_argument("--task", default="gsm8k",
+                   choices=["gsm8k", "arithmetic", "svamp", "multiarith"],
+                   help="which task to gate (check base pass@k before RL)")
     args = p.parse_args()
 
     if args.gate:
         run_gate(args.ckpt, n=args.n, k=args.k, temperature=args.temperature,
-                 max_new_tokens=args.max_new_tokens, lenient=not args.strict)
+                 max_new_tokens=args.max_new_tokens, lenient=not args.strict,
+                 task_name=args.task)
     else:
         # smoke test: load, show one example, sanity-check the reward
         task = GSM8K(subset="main", split="train")

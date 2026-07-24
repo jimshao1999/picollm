@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from chat_cli import device, load_model
-from tasks.gsm8k import GSM8K
+from tasks import make_task
 from tokenizer import ChatTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -192,6 +192,9 @@ def rl_train(
     top_k=50,
     strict_reward=False,
     grad_clip=1.0,
+    kl_coef=0.0,  # KL-to-reference (SFT) penalty; 0 = off. anchors policy, prevents collapse
+    warmup_steps=20,  # linear LR warmup — the first RL steps are the most destructive
+    task_name="gsm8k",
     eval_every=250,
     eval_n=50,
     eval_k=8,
@@ -213,9 +216,17 @@ def rl_train(
     master = rank == 0
     raw_model = load_model(ckpt_path)
     model = DDP(raw_model, device_ids=[local_rank]) if ddp else raw_model
+    ref_model = None
+    if kl_coef > 0:
+        # frozen copy of the SFT model = the KL anchor (keeps the policy from drifting
+        # into degenerate/collapsed outputs). no grad, no optimizer.
+        ref_model = load_model(ckpt_path)
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+        ref_model.eval()
     tok = ChatTokenizer()
-    task = GSM8K(subset="main", split="train")
-    val_task = GSM8K(subset="main", split="test")
+    task = make_task(task_name, "train")
+    val_task = make_task(task_name, "test")
     device_type = "cuda" if device.startswith("cuda") else device
     optimizer = raw_model.configure_optimizers(
         weight_decay=0.0, learning_rate=lr, device=device
@@ -229,6 +240,12 @@ def rl_train(
     examples_per_rank = max(examples_per_step // world, 1)
     cursor = rank
     for step in range(steps):
+        ## linear LR warmup: ramp 0 -> lr over the first `warmup_steps` steps so the
+        ## fragile early updates can't destroy the SFT policy (the hard-dip failure mode)
+        cur_lr = lr * min(1.0, (step + 1) / max(warmup_steps, 1))
+        for g in optimizer.param_groups:
+            g["lr"] = cur_lr
+
         ## periodic eval on the test split (honest progress metric)
         if step % eval_every == 0:
             p1, pk = evaluate_passk(
@@ -280,7 +297,7 @@ def rl_train(
         optimizer.zero_grad()
         # token-level normalization across all rollouts in this step
         num_valid = max(sum(int((r["targets"] != -1).sum()) for r in rollouts), 1)
-        reward_sum, sample_count = 0.0, 0
+        reward_sum, sample_count, kl_running = 0.0, 0, 0.0
         for j, r in enumerate(rollouts):
             is_last = j == len(rollouts) - 1
             sync_ctx = (
@@ -292,23 +309,34 @@ def rl_train(
                     # model returns (logits, loss); with reduction="none", loss is per-token
                     _, loss = model(inputs, targets, loss_reduction="none")
                     logp = -loss.view_as(inputs)  # (k, T) per-token log-probs
+                    kl_term = logp.new_zeros(())
+                    if ref_model is not None:
+                        with torch.no_grad():
+                            _, loss_ref = ref_model(inputs, targets, loss_reduction="none")
+                        logp_ref = -loss_ref.view_as(inputs)
+                        # k3 KL estimator (>=0); auto-0 at masked tokens (both logp==0 there)
+                        log_ratio = torch.clamp(logp_ref - logp, -10.0, 10.0)
+                        kl = torch.exp(log_ratio) - log_ratio - 1.0
+                        kl_term = kl.sum() / num_valid
                 pg_obj = (logp * advantages.unsqueeze(-1)).sum() / num_valid  # scalar
-                (-pg_obj).backward()  # accumulate grads across rollouts
+                (-pg_obj + kl_coef * kl_term).backward()  # PG + KL anchor
             reward_sum += r["rewards"].sum().item()
             sample_count += r["rewards"].numel()
+            kl_running += float(kl_term.detach())
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        # NOTE: reward is averaged over TRAINED (non-degenerate) groups only, so it
-        # reads high vs true accuracy; watch the trend, and 'degenerate' for sparsity.
+        # NOTE: reward is over this step's groups (incl. degenerate=0-reward ones).
+        # watch eval_pass@1 (the honest metric) and 'kl' (should stay small, not blow up).
         if master:
             mean_reward = reward_sum / sample_count
+            mean_kl = kl_running / max(len(rollouts), 1)
             print(
-                f"step={step:4d} | reward={mean_reward:.4f} | groups={len(rollouts)} | "
-                f"degenerate_skipped={degenerate} | valid_tokens={num_valid}"
+                f"step={step:4d} | reward={mean_reward:.4f} | kl={mean_kl:.4f} | "
+                f"groups={len(rollouts)} | degenerate={degenerate} | valid_tokens={num_valid}"
             )
             with open(log_file, "a") as f:
-                f.write(f"{step} reward {mean_reward:.4f} degenerate {degenerate}\n")
+                f.write(f"{step} reward {mean_reward:.4f} kl {mean_kl:.4f} degenerate {degenerate}\n")
 
         ## periodic checkpoint (and always at the last step)
         if master and step > 0 and (step % ckpt_every == 0 or step == steps - 1):
@@ -331,11 +359,12 @@ def run_verify(
     top_k=50,
     strict_reward=False,
     scan=30,
+    task_name="gsm8k",
 ):
     """Inspect ONE non-degenerate rollout (no training) to sanity-check mechanics."""
     model = load_model(ckpt_path)
     tok = ChatTokenizer()
-    task = GSM8K(subset="main", split="train")
+    task = make_task(task_name, "train")
     device_type = "cuda" if device.startswith("cuda") else device
 
     for i in range(scan):
@@ -394,6 +423,13 @@ if __name__ == "__main__":
     p.add_argument(
         "--strict", action="store_true", help="strict reward (require '#### N')"
     )
+    p.add_argument("--kl-coef", type=float, default=0.1,
+                   help="KL-to-SFT-reference penalty (anchors policy; 0 = off)")
+    p.add_argument("--warmup-steps", type=int, default=20,
+                   help="linear LR warmup steps (protects the fragile early RL updates)")
+    p.add_argument("--task", default="gsm8k",
+                   choices=["gsm8k", "arithmetic", "svamp", "multiarith"],
+                   help="which verifiable-reward task to RL on (easier fallbacks if GSM8K is too hard)")
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-n", type=int, default=50)
     p.add_argument("--ckpt-every", type=int, default=1000)
@@ -418,6 +454,7 @@ if __name__ == "__main__":
             k=args.k,
             max_new_tokens=args.max_new_tokens,
             strict_reward=args.strict,
+            task_name=args.task,
         )
     else:
         rl_train(
@@ -428,6 +465,9 @@ if __name__ == "__main__":
             lr=args.lr,
             max_new_tokens=args.max_new_tokens,
             strict_reward=args.strict,
+            kl_coef=args.kl_coef,
+            warmup_steps=args.warmup_steps,
+            task_name=args.task,
             eval_every=args.eval_every,
             eval_n=args.eval_n,
             ckpt_every=args.ckpt_every,

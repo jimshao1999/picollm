@@ -21,6 +21,8 @@ class SFTConfig(TrainConfig):
     base_checkpoint: str = "log/model_step_19072.pt"
     mix_gsm8k: bool = False  # blend GSM8K into SFT (teaches math + #### format for RL)
     gsm8k_epochs: int = 4
+    mix_arithmetic: bool = False  # drill synthetic arithmetic w/ CoT (teach the model to compute)
+    arithmetic_weight: int = 4
 
 
 class SFTTrainer(BaseTrainer):
@@ -36,6 +38,8 @@ class SFTTrainer(BaseTrainer):
             tokenizer=self.tok,
             mix_gsm8k=c.mix_gsm8k,
             gsm8k_epochs=c.gsm8k_epochs,
+            mix_arithmetic=c.mix_arithmetic,
+            arithmetic_weight=c.arithmetic_weight,
         )
         self.val_loader = SFTDataLoader(
             c.B,
@@ -46,6 +50,8 @@ class SFTTrainer(BaseTrainer):
             tokenizer=self.tok,
             mix_gsm8k=c.mix_gsm8k,
             gsm8k_epochs=c.gsm8k_epochs,
+            mix_arithmetic=c.mix_arithmetic,
+            arithmetic_weight=c.arithmetic_weight,
         )
 
     def setup_model(self):
@@ -164,6 +170,17 @@ if __name__ == "__main__":
         help="blend GSM8K into the SFT mixture (teaches math + #### format for RL)",
     )
     parser.add_argument(
+        "--mix-arithmetic",
+        action="store_true",
+        help="drill synthetic arithmetic w/ worked CoT (teach the model to actually compute)",
+    )
+    parser.add_argument(
+        "--arithmetic-weight",
+        type=int,
+        default=None,
+        help="epochs/weight for the arithmetic set in the mixture (default 4; raise to drill harder)",
+    )
+    parser.add_argument(
         "--device-batch-size",
         type=int,
         default=None,
@@ -180,6 +197,10 @@ if __name__ == "__main__":
         overrides["resume_path"] = args.resume
     if args.mix_gsm8k:
         overrides["mix_gsm8k"] = True
+    if args.mix_arithmetic:
+        overrides["mix_arithmetic"] = True
+    if args.arithmetic_weight is not None:
+        overrides["arithmetic_weight"] = args.arithmetic_weight
     if args.device_batch_size is not None:
         overrides["B"] = args.device_batch_size
 

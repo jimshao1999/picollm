@@ -2,7 +2,7 @@
 
 Have fun training LLM!
 
-Training a 1B model from scratch: start by reproducing **GPT-2 (124M)**, modernize the architecture, then scale to ~1B and pretrain Chinchilla-optimally on 20B tokens of FineWeb-Edu (38000 steps ≈ 20 tokens/param). Then SFT into a chat model and RL on GSM8K.
+Training a 1B model from scratch: start by reproducing **GPT-2 (124M)**, modernize the architecture, then scale to ~1B and pretrain Chinchilla-optimally on 20B tokens of FineWeb-Edu (38000 steps ≈ 20 tokens/param). Then SFT into a chat model and post-train with **GRPO** — including a working RLVR result where an SFT arithmetic drill lifts a skill the base lacked (`0% → 48%`) and RL amplifies it (`48% → 76%`).
 
 ## Layout
 
@@ -17,8 +17,11 @@ Training a 1B model from scratch: start by reproducing **GPT-2 (124M)**, moderni
 | `sft_data.py` | `SFTDataLoader` + `MixtureDataset` (SmolTalk + optional GSM8K blend) |
 | `chat_sft.py` | `SFTTrainer` — full-weight SFT (overfit gate, `--mix-gsm8k`, `--resume`) |
 | `chat_cli.py` | load a checkpoint + `generate_reply`; interactive chat REPL |
-| `tasks/gsm8k.py` | GSM8K task (`reward`/`evaluate`) + pass@k signal gate (`--gate`) |
-| `rl_train.py` | GRPO RL on GSM8K (batched rollouts, DDP, pass@k eval, checkpoint) |
+| `tasks/gsm8k.py` | GSM8K task (`reward`/`evaluate`) + pass@k signal gate (`--gate --task ...`) |
+| `tasks/arithmetic.py` | synthetic arithmetic task w/ worked CoT solutions (tunable difficulty) |
+| `tasks/simple_math.py` | easier real math sets (SVAMP / MultiArith) — same task interface |
+| `tasks/__init__.py` | `make_task(name, split)` registry (gsm8k / arithmetic / svamp / multiarith) |
+| `rl_train.py` | GRPO RL (`--task`, batched rollouts, DDP, KL anchor, LR warmup, pass@k eval) |
 | `plot_results.py` | loss + HellaSwag comparison plots (`plots/`) |
 | `run_d26.sh` | auto-resume wrapper for the long 1B run (rides out NCCL flakes) |
 
@@ -81,7 +84,11 @@ the gain is extra capacity, not pure architectural efficiency.
 
 Supervised fine-tuning on [SmolTalk](https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk) (see Usage step 3) turns the autocompleter into a chat model. Conversations are rendered with role special tokens (reusing the free padded vocab slots 50257–50260) and loss is masked to assistant tokens only (`ignore_index=-1`). An `--overfit` mode memorizes a single batch (loss → ~0) as a pipeline sanity check.
 
-Result on the 124M base (2000 steps, LR 3e-5): train/val loss plateau at **~1.73**. The plateau is expected — SFT loss floors at the entropy of free-form assistant text; it can't reach 0 like the single-batch overfit. The model replies coherently in chat format and stops on `<|assistant_end|>` (it hallucinates freely — a 124M-scale limit, not an SFT bug).
+Result on the 124M base (2000 steps, LR 3e-5): train/val loss plateau at **~1.71**. The plateau is expected — SFT loss floors at the entropy of free-form assistant text; it can't reach 0 like the single-batch overfit. The model replies coherently in chat format and stops on `<|assistant_end|>` (it hallucinates freely — a 124M-scale limit, not an SFT bug).
+
+Running the **same SFT mix (SmolTalk + GSM8K×4) on the 1B base** converges much lower — **val 1.29 vs 1.71** — and keeps improving a bit longer before flattening (~step 1750), where the 124M plateaus almost immediately. Both are ~2 epochs; more would just start memorizing the 7.5K GSM8K problems.
+
+![SFT val loss — 1B vs 124M](plots/sft_curve.png)
 
 ## RL (GRPO) and why we move to a 1B model
 
@@ -111,6 +118,26 @@ Scaled the modern architecture to **~1.03B params** (`--depth 26`: 26 layers, 16
 The HellaSwag plot is the punchline: **at 124M, HellaSwag is stuck near chance** (flat ~0.28, just under GPT-2 124M's 0.2955) no matter how long you train. **Scaling to 1B unlocks it** — HellaSwag climbs steadily to **0.381**, clearing GPT-2 124M and reaching GPT-2 Large (774M, ~0.395). This is emergence with scale: the same capability threshold that kept the 124M's GSM8K/HellaSwag near zero is crossed at 1B. Val loss also drops well below both 124M runs (2.79 vs 3.18). The base is coherent and ready for SFT/RL — where, unlike at 124M, there's now real reasoning ability to surface and amplify.
 
 (External GPT-2 *loss* is omitted from the loss plot: it's on a different corpus/tokenizer and isn't comparable to our FineWeb-Edu val loss. HellaSwag is a standard benchmark, so GPT-2 124M / Large / XL appear as reference lines. Regenerate with `python plot_results.py`.)
+
+## Post-training RL (GRPO): install the skill in SFT, then amplify it with RL
+
+At 1B we returned to GRPO. Retrying it on **GSM8K still flatlined** — pass@1 stuck ~1%, and the per-step diagnostics showed **~7 of 8 groups degenerate** (every sample wrong → zero-variance rewards → zero gradient). Probing the *pretrained base* explained why: prompted `6 + 3 =`, it greedily completes with `___`. It learned the **surface form** of arithmetic worksheets from web text, not how to compute. RL only *amplifies* a skill the model already has — and there was none to amplify.
+
+Two classic RL-stability failure modes showed up (and were fixed) along the way:
+- **Entropy collapse** — without a KL penalty the GSM8K policy degenerated: pass@8 fell to pass@1 and generations ran to the max length. A **k3 KL penalty to the frozen SFT reference** anchored the policy and stopped it.
+- **Destructive early updates** — a fresh policy + large group-relative gradients meant a too-high LR wrecked the model in the first few steps (pass@8 crashed 0.93 → 0.50). Fixed with **LR warmup** (`--warmup-steps`).
+
+So the fix was to **install the skill in SFT first, then let RL amplify it.** We SFT-drilled synthetic **arithmetic with worked chain-of-thought** (place-value decomposition) blended into SmolTalk (`--mix-arithmetic`), then ran GRPO on held-out 2-digit add/sub:
+
+| stage | pass@1 | pass@8 |
+|-------|--------|--------|
+| pretrained 1B base | ~0.00 (completes `6 + 3 =` with `___`) | — |
+| + SFT arithmetic drill (CoT) | 0.48 | 0.90 |
+| + GRPO RL (1000 steps, LR 1e-5 + warmup, KL 0.03) | **0.76** | **0.96** |
+
+![arithmetic RLVR — pass@1 climbs under GRPO](plots/rl_curve.png)
+
+The contrast with GSM8K is the whole lesson: RLVR works **only when the base already succeeds often enough to make groups non-degenerate.** At GSM8K's ~1% base rate, ~7/8 groups gave zero gradient and pass@1 never moved; at arithmetic's 48% base rate almost no group was degenerate, and GRPO lifted pass@1 by **+28 points** (0.48 → 0.76), closing most of the gap to the pass@8 ceiling. **SFT installs capability; RL amplifies it** — you can't RL your way to a skill the base lacks.
 
 ## Reference
 

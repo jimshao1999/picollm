@@ -42,6 +42,15 @@ GPT2_HELLA_REF = {
 # our GPT-2 124M baseline only has a final HellaSwag value (recovered), not a curve
 BASELINE_FINAL_HELLA = (19072, 0.281)
 
+# SFT runs (same SmolTalk + GSM8K×4 mix) — label -> (log file, color)
+SFT_RUNS = {
+    "SFT 124M (SmolTalk + GSM8K)": ("log_sft_mixed/log.txt", "tab:blue"),
+    "SFT 1B / d26 (SmolTalk + GSM8K)": ("log_sft_d26/log.txt", "tab:red"),
+}
+
+# the successful arithmetic RLVR run (GRPO on the SFT-drilled 1B)
+RL_LOG = "log_rl_d26_arith3/log.txt"
+
 
 def parse_log(path, key):
     """Return (steps, values) for lines shaped like '<step> <key> <value>'."""
@@ -109,9 +118,54 @@ def plot_hellaswag():
     print("wrote plots/hellaswag_curve.png")
 
 
+def plot_sft():
+    plt.figure(figsize=(8, 5))
+    for name, (path, color) in SFT_RUNS.items():
+        s, v = parse_log(path, "val")
+        if v:
+            plt.plot(s, v, marker="o", ms=3, lw=1.6, color=color, label=name)
+            plt.annotate(f"{v[-1]:.2f}", (s[-1], v[-1]), textcoords="offset points",
+                         xytext=(6, 0), fontsize=9, color=color, va="center")
+    plt.xlabel("SFT step  (×0.5M tokens/step)")
+    plt.ylabel("SFT val loss — SmolTalk + GSM8K (nats)")
+    plt.title("SFT validation loss — 1B vs 124M (same data)")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    os.makedirs("plots", exist_ok=True)
+    plt.savefig("plots/sft_curve.png", dpi=150, bbox_inches="tight")
+    print("wrote plots/sft_curve.png")
+
+
+def plot_rl():
+    """GRPO on arithmetic: pass@1 climbing from the SFT start toward pass@k."""
+    s1, v1 = parse_log(RL_LOG, "eval_pass@1")
+    s8, v8 = parse_log(RL_LOG, "eval_pass@8")
+    if not v1:
+        print(f"  [warn] no RL evals in {RL_LOG}; skipping rl_curve")
+        return
+    plt.figure(figsize=(8, 5))
+    plt.plot(s8, v8, marker="s", ms=3, lw=1.4, color="tab:orange", label="pass@8 (ceiling)")
+    plt.plot(s1, v1, marker="o", ms=3, lw=1.8, color="tab:red", label="pass@1")
+    plt.axhline(v1[0], ls=":", lw=1.0, color="tab:red", alpha=0.6,
+                label=f"SFT start pass@1 = {v1[0]:.2f}")
+    plt.annotate(f"{v1[-1]:.2f}", (s1[-1], v1[-1]), textcoords="offset points",
+                 xytext=(6, 0), fontsize=9, color="tab:red", va="center")
+    plt.xlabel("GRPO step")
+    plt.ylabel("arithmetic accuracy (held-out 2-digit add/sub)")
+    plt.title("RLVR that works: GRPO lifts pass@1 from SFT 0.48 → 0.76")
+    plt.ylim(0, 1)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    os.makedirs("plots", exist_ok=True)
+    plt.savefig("plots/rl_curve.png", dpi=150, bbox_inches="tight")
+    print("wrote plots/rl_curve.png")
+
+
 if __name__ == "__main__":
     plot_loss()
     plot_hellaswag()
+    plot_sft()
+    plot_rl()
     # quick summary of final numbers
     print("\nfinal numbers:")
     for name, path in RUNS.items():
@@ -120,3 +174,7 @@ if __name__ == "__main__":
         vfin = v[-1] if v else None
         hfin = h[-1] if h else BASELINE_FINAL_HELLA[1]
         print(f"  {name:32s} val={vfin}  hella={hfin}")
+    print("SFT final val:")
+    for name, (path, _) in SFT_RUNS.items():
+        _, v = parse_log(path, "val")
+        print(f"  {name:34s} val={v[-1] if v else None}")

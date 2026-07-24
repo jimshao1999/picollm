@@ -41,21 +41,32 @@ class SFTDataLoader:
         tokenizer=None,
         mix_gsm8k=False,
         gsm8k_epochs=4,
+        mix_arithmetic=False,
+        arithmetic_n=50000,
+        arithmetic_weight=4,
     ):
         self.B = B
         self.T = T
         self.proc_rank = proc_rank
         self.num_procs = num_procs
         assert split in {"train", "test"}
-        if mix_gsm8k:
-            # blend GSM8K (weighted) into SmolTalk so the model learns math + the
-            # "#### <answer>" format -> higher GSM8K pass@k -> denser RL signal.
-            from tasks.gsm8k import GSM8K
+        if mix_gsm8k or mix_arithmetic:
+            # blend weighted math into SmolTalk so the model learns to compute + the
+            # "#### <answer>" format -> higher pass@k -> denser RL signal.
+            datasets, weights = [SmolTalk(split=split)], [1]
+            if mix_gsm8k:
+                from tasks.gsm8k import GSM8K
 
-            self.dataset = MixtureDataset(
-                [SmolTalk(split=split), GSM8K(subset="main", split=split)],
-                weights=[1, gsm8k_epochs],
-            )
+                datasets.append(GSM8K(subset="main", split=split))
+                weights.append(gsm8k_epochs)
+            if mix_arithmetic:
+                # synthetic arithmetic drill with worked CoT solutions (teaches the
+                # model to actually compute, which GSM8K/RL alone can't at this scale)
+                from tasks.arithmetic import Arithmetic
+
+                datasets.append(Arithmetic(split=split, n=arithmetic_n))
+                weights.append(arithmetic_weight)
+            self.dataset = MixtureDataset(datasets, weights=weights)
         else:
             self.dataset = SmolTalk(split=split)
         self.n = len(self.dataset)
